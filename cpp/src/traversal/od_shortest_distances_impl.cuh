@@ -114,6 +114,61 @@ struct check_destination_index_t {
   }
 };
 
+// Helper for CAS-based atomic min on float
+__device__ inline void atomic_min_float(float* addr, float value)
+{
+  float old_val = *addr;
+  while (value < old_val) {
+    float assumed       = old_val;
+    unsigned int old_ui = atomicCAS(
+      reinterpret_cast<unsigned int*>(addr), __float_as_uint(assumed), __float_as_uint(value));
+    old_val = __uint_as_float(old_ui);
+    if (old_val == assumed) break;
+  }
+}
+
+// Helper for CAS-based atomic min on double
+__device__ inline void atomic_min_double(double* addr, double value)
+{
+  unsigned long long int* addr_as_ull = reinterpret_cast<unsigned long long int*>(addr);
+  unsigned long long int old_ull      = *addr_as_ull;
+  double old_val                      = __longlong_as_double(old_ull);
+  while (value < old_val) {
+    unsigned long long int assumed_ull = old_ull;
+    old_ull = atomicCAS(addr_as_ull, assumed_ull, __double_as_longlong(value));
+    old_val = __longlong_as_double(old_ull);
+    if (old_ull == assumed_ull) break;
+  }
+}
+
+template <typename vertex_t, typename tag_t, typename key_t, typename weight_t>
+struct update_od_matrix_atomic_min_t {
+  raft::device_span<tag_t const> v_to_destination_indices{};
+  raft::device_span<weight_t> od_matrix{};
+  tag_t num_origins{};
+  tag_t num_destinations{};
+  tag_t invalid_od_idx{};
+
+  __device__ void operator()(cuda::std::tuple<key_t, weight_t> kv) const
+  {
+    auto key      = cuda::std::get<0>(kv);
+    auto distance = cuda::std::get<1>(kv);
+    auto v        = static_cast<vertex_t>(key / static_cast<key_t>(num_origins));
+    auto dest_idx = v_to_destination_indices[v];
+    if (dest_idx != invalid_od_idx) {
+      auto tag = static_cast<size_t>(key % static_cast<key_t>(num_origins));
+      auto od_matrix_offset =
+        (tag * static_cast<size_t>(num_destinations)) + static_cast<size_t>(dest_idx);
+      weight_t* addr = od_matrix.data() + od_matrix_offset;
+      if constexpr (std::is_same_v<weight_t, float>) {
+        atomic_min_float(addr, distance);
+      } else if constexpr (std::is_same_v<weight_t, double>) {
+        atomic_min_double(addr, distance);
+      }
+    }
+  }
+};
+
 template <typename vertex_t, typename tag_t, typename key_t, typename weight_t>
 struct e_op_t {
   detail::kv_cuco_store_find_device_view_t<detail::kv_cuco_store_view_t<key_t, weight_t const*>>
@@ -606,25 +661,18 @@ rmm::device_uvector<weight_t> od_shortest_distances(
                            thrust::make_constant_iterator(weight_t{0.0}),
                            handle.get_stream());
 
-    thrust::transform_if(handle.get_thrust_policy(),
-                         thrust::make_constant_iterator(weight_t{0.0}),
-                         thrust::make_constant_iterator(weight_t{0.0}) + origins.size(),
-                         key_first,
-                         thrust::make_permutation_iterator(
-                           od_matrix.begin(),
-                           thrust::make_transform_iterator(
-                             key_first,
-                             compute_od_matrix_index_t<vertex_t, od_idx_t, key_t>{
-                               raft::device_span<od_idx_t const>(v_to_destination_indices.data(),
-                                                                 v_to_destination_indices.size()),
-                               static_cast<od_idx_t>(origins.size()),
-                               static_cast<od_idx_t>(destinations.size())})),
-                         cuda::std::identity{},
-                         check_destination_index_t<vertex_t, od_idx_t, key_t>{
-                           raft::device_span<od_idx_t const>(v_to_destination_indices.data(),
-                                                             v_to_destination_indices.size()),
-                           static_cast<od_idx_t>(origins.size()),
-                           invalid_od_idx});
+    auto kv_pair_first =
+      thrust::make_zip_iterator(key_first, thrust::make_constant_iterator(weight_t{0.0}));
+    thrust::for_each(handle.get_thrust_policy(),
+                     kv_pair_first,
+                     kv_pair_first + origins.size(),
+                     update_od_matrix_atomic_min_t<vertex_t, od_idx_t, key_t, weight_t>{
+                       raft::device_span<od_idx_t const>(v_to_destination_indices.data(),
+                                                         v_to_destination_indices.size()),
+                       raft::device_span<weight_t>(od_matrix.data(), od_matrix.size()),
+                       static_cast<od_idx_t>(origins.size()),
+                       static_cast<od_idx_t>(destinations.size()),
+                       invalid_od_idx});
   }
 
   // 6. SSSP iteration
@@ -730,25 +778,18 @@ rmm::device_uvector<weight_t> od_shortest_distances(
     // 6-3. update od_matrix
 
     {
-      thrust::transform_if(handle.get_thrust_policy(),
-                           distance_buffer.begin(),
-                           distance_buffer.end(),
-                           new_frontier_keys.begin(),
-                           thrust::make_permutation_iterator(
-                             od_matrix.begin(),
-                             thrust::make_transform_iterator(
-                               new_frontier_keys.begin(),
-                               compute_od_matrix_index_t<vertex_t, od_idx_t, key_t>{
-                                 raft::device_span<od_idx_t const>(v_to_destination_indices.data(),
-                                                                   v_to_destination_indices.size()),
-                                 static_cast<od_idx_t>(origins.size()),
-                                 static_cast<od_idx_t>(destinations.size())})),
-                           cuda::std::identity{},
-                           check_destination_index_t<vertex_t, od_idx_t, key_t>{
-                             raft::device_span<od_idx_t const>(v_to_destination_indices.data(),
-                                                               v_to_destination_indices.size()),
-                             static_cast<od_idx_t>(origins.size()),
-                             invalid_od_idx});
+      auto kv_pair_first =
+        thrust::make_zip_iterator(new_frontier_keys.begin(), distance_buffer.begin());
+      thrust::for_each(handle.get_thrust_policy(),
+                       kv_pair_first,
+                       kv_pair_first + new_frontier_keys.size(),
+                       update_od_matrix_atomic_min_t<vertex_t, od_idx_t, key_t, weight_t>{
+                         raft::device_span<od_idx_t const>(v_to_destination_indices.data(),
+                                                           v_to_destination_indices.size()),
+                         raft::device_span<weight_t>(od_matrix.data(), od_matrix.size()),
+                         static_cast<od_idx_t>(origins.size()),
+                         static_cast<od_idx_t>(destinations.size()),
+                         invalid_od_idx});
     }
 
     // 6-4. update the queues
